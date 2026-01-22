@@ -1,6 +1,6 @@
 use std::{fs::File, io::Write};
 
-use anyhow::Ok;
+use anyhow::Context;
 use futures_util::{AsyncBufReadExt, StreamExt, TryStreamExt, stream};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
@@ -10,28 +10,38 @@ use kube::{
 };
 use tracing::info;
 
-async fn logger(pods: Api<Pod>, pod_name: String) -> anyhow::Result<()> {
-    info!("Fetching logs for {}", pod_name);
-    let mut output_log = File::create(format!("logs/{pod_name}.log"))?;
-    let mut logs = pods
-        .log_stream(
-            &pod_name,
-            &LogParams {
-                follow: true,
-                // container: app.container,
-                //timestamps: true,
-                ..LogParams::default()
-            },
-        )
-        .await?
-        .lines();
+async fn logger(pods: Api<Pod>, pod_name: String) {
+    async fn inner(pods: Api<Pod>, pod_name: String) -> anyhow::Result<()> {
+        info!("Fetching logs for {}", pod_name);
+        let log_path = format!("logs/{pod_name}.log");
+        let mut output_log =
+            File::create(&log_path).with_context(|| format!("Opening {log_path}"))?;
+        let mut logs = pods
+            .log_stream(
+                &pod_name,
+                &LogParams {
+                    follow: true,
+                    // container: app.container,
+                    //timestamps: true,
+                    ..LogParams::default()
+                },
+            )
+            .await?
+            .lines();
 
-    while let Some(line) = logs.try_next().await? {
-        println!("{}: {}", pod_name, line);
-        output_log.write_all(line.as_bytes())?;
-        output_log.write_all("\n".as_bytes())?;
+        while let Some(line) = logs.try_next().await? {
+            println!("{}: {}", pod_name, line);
+            output_log.write_all(line.as_bytes())?;
+            output_log.write_all("\n".as_bytes())?;
+        }
+        Ok(())
     }
-    Ok(())
+    match inner(pods, pod_name.clone()).await {
+        Ok(_) => {}
+        Err(error) => {
+            println!("{pod_name}: error {error:?}");
+        }
+    }
 }
 
 #[tokio::main]
@@ -62,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Running!");
                 tokio::spawn(logger(local_api, pod_name));
             }
-            std::result::Result::Ok(())
+            Ok(())
         })
         .await?;
     Ok(())
