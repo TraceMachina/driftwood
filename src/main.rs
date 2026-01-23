@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::Context;
 use futures_util::{AsyncBufReadExt, TryStreamExt};
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Namespace, Pod};
 use kube::{
     Api, Client, ResourceExt,
     api::LogParams,
@@ -96,6 +96,12 @@ async fn main() -> anyhow::Result<()> {
         Ok(ns_var) => ns_var,
         Err(_) => client.default_namespace().to_string(),
     };
+
+    let namespaces: Api<Namespace> = Api::all(client.clone());
+    let namespace = namespaces.get(&ns).await;
+    if let Err(e) = namespace {
+        return Err(e.into());
+    }
 
     let pods: Api<Pod> = Api::namespaced(client, &ns);
 
