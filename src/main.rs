@@ -1,17 +1,17 @@
 use std::{
     collections::HashSet,
-    fs::{create_dir_all, File},
+    fs::{File, create_dir_all},
     io::Write,
     sync::Arc,
 };
 
 use anyhow::Context;
-use futures_util::{StreamExt, TryStreamExt, AsyncBufReadExt};
+use futures_util::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
-    api::LogParams,
-    runtime::{watcher, WatchStreamExt},
     Api, Client, ResourceExt,
+    api::LogParams,
+    runtime::{WatchStreamExt, watcher},
 };
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -21,12 +21,8 @@ async fn stream_container_logs(
     pod_name: String,
     container: String,
 ) -> anyhow::Result<()> {
-    let dir = format!("logs/{pod_name}");
-    create_dir_all(&dir).with_context(|| format!("creating {dir}"))?;
-
-    let log_path = format!("{dir}/{container}.log");
-    let mut file = File::create(&log_path)
-        .with_context(|| format!("opening {log_path}"))?;
+    let log_path = format!("logs/{pod_name}/{container}.log");
+    let mut file = File::create(&log_path).with_context(|| format!("opening {log_path}"))?;
 
     info!("starting logs for {pod_name}/{container}");
 
@@ -37,7 +33,6 @@ async fn stream_container_logs(
                 container: Some(container.clone()),
                 follow: true,
                 tail_lines: Some(500),
-                timestamps: true,
                 ..LogParams::default()
             },
         )
@@ -52,27 +47,43 @@ async fn stream_container_logs(
     Ok(())
 }
 
-async fn start_pod_logging(pods: Api<Pod>, pod: Pod) -> anyhow::Result<()> {
-    let pod_name = pod.name_any();
+async fn start_pod_logging(pods: Api<Pod>, pod: Pod) {
+    async fn inner(pods: Api<Pod>, pod: &Pod) -> anyhow::Result<()> {
+        let pod_name = pod.name_any();
 
-    let containers = pod
-        .spec
-        .as_ref()
-        .map(|s| s.containers.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
-        .unwrap_or_default();
+        let dir = format!("logs/{pod_name}");
+        create_dir_all(&dir).with_context(|| format!("creating {dir}"))?;
 
-    for container in containers {
-        let pods = pods.clone();
-        let pod_name = pod_name.clone();
+        let containers = pod
+            .spec
+            .as_ref()
+            .map(|s| {
+                s.containers
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
-        tokio::spawn(async move {
-            if let Err(e) = stream_container_logs(pods, pod_name, container).await {
-                warn!("log stream error: {e:?}");
-            }
-        });
+        for container in containers {
+            let pods = pods.clone();
+            let pod_name = pod_name.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = stream_container_logs(pods, pod_name, container).await {
+                    warn!("log stream error: {e:?}");
+                }
+            });
+        }
+
+        Ok(())
     }
-
-    Ok(())
+    match inner(pods, &pod).await {
+        Ok(_) => {}
+        Err(error) => {
+            println!("{}: error {error:?}", pod.name_any());
+        }
+    };
 }
 
 #[tokio::main]
@@ -80,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let client = Client::try_default().await?;
-    let pods: Api<Pod> = Api::namespaced(client, "nativelink");
+    let pods: Api<Pod> = Api::default_namespaced(client);
 
     let seen = Arc::new(Mutex::new(HashSet::<String>::new()));
 
@@ -101,10 +112,7 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(status) = &pod.status {
                     if let Some(conditions) = &status.conditions {
                         for c in conditions {
-                            info!(
-                                "pod {} condition {} = {}",
-                                pod_name, c.type_, c.status
-                            );
+                            info!("pod {} condition {} = {}", pod_name, c.type_, c.status);
                         }
                     }
 
@@ -123,9 +131,7 @@ async fn main() -> anyhow::Result<()> {
                 if phase == Some(&"Running".to_string()) {
                     let mut seen = seen.lock().await;
                     if seen.insert(uid) {
-                        if let Err(e) = start_pod_logging(pods, pod).await {
-                            warn!("failed to start logging for pod {}: {e:?}", pod_name);
-                        }
+                        start_pod_logging(pods, pod).await;
                     }
                 }
 
