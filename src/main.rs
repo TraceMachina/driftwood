@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    env,
     fs::{File, create_dir_all},
     io::Write,
     sync::Arc,
@@ -91,7 +92,12 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let client = Client::try_default().await?;
-    let pods: Api<Pod> = Api::default_namespaced(client);
+    let ns = match env::var("DRIFTWOOD_NS") {
+        Ok(ns_var) => ns_var,
+        Err(_) => client.default_namespace().to_string(),
+    };
+
+    let pods: Api<Pod> = Api::namespaced(client, &ns);
 
     let seen = Arc::new(Mutex::new(HashSet::<String>::new()));
 
