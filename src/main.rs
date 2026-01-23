@@ -1,79 +1,144 @@
-use std::{fs::File, io::Write};
+use std::{
+    collections::HashSet,
+    fs::{File, create_dir_all},
+    io::Write,
+    sync::Arc,
+};
 
 use anyhow::Context;
-use futures_util::{AsyncBufReadExt, StreamExt, TryStreamExt, stream};
+use futures_util::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     Api, Client, ResourceExt,
     api::LogParams,
     runtime::{WatchStreamExt, watcher},
 };
-use tracing::info;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
 
-async fn logger(pods: Api<Pod>, pod_name: String) {
-    async fn inner(pods: Api<Pod>, pod_name: String) -> anyhow::Result<()> {
-        info!("Fetching logs for {}", pod_name);
-        let log_path = format!("logs/{pod_name}.log");
-        let mut output_log =
-            File::create(&log_path).with_context(|| format!("Opening {log_path}"))?;
-        let mut logs = pods
-            .log_stream(
-                &pod_name,
-                &LogParams {
-                    follow: true,
-                    // container: app.container,
-                    //timestamps: true,
-                    ..LogParams::default()
-                },
-            )
-            .await?
-            .lines();
+async fn stream_container_logs(
+    pods: Api<Pod>,
+    pod_name: String,
+    container: String,
+) -> anyhow::Result<()> {
+    let log_path = format!("logs/{pod_name}/{container}.log");
+    let mut file = File::create(&log_path).with_context(|| format!("opening {log_path}"))?;
 
-        while let Some(line) = logs.try_next().await? {
-            println!("{}: {}", pod_name, line);
-            output_log.write_all(line.as_bytes())?;
-            output_log.write_all("\n".as_bytes())?;
+    info!("starting logs for {pod_name}/{container}");
+
+    let mut stream = pods
+        .log_stream(
+            &pod_name,
+            &LogParams {
+                container: Some(container.clone()),
+                follow: true,
+                tail_lines: Some(500),
+                ..LogParams::default()
+            },
+        )
+        .await?
+        .lines();
+
+    while let Some(line) = stream.try_next().await? {
+        println!("{pod_name}/{container}: {line}");
+        writeln!(file, "{line}")?;
+    }
+
+    Ok(())
+}
+
+async fn start_pod_logging(pods: Api<Pod>, pod: Pod) {
+    async fn inner(pods: Api<Pod>, pod: &Pod) -> anyhow::Result<()> {
+        let pod_name = pod.name_any();
+
+        let dir = format!("logs/{pod_name}");
+        create_dir_all(&dir).with_context(|| format!("creating {dir}"))?;
+
+        let containers = pod
+            .spec
+            .as_ref()
+            .map(|s| {
+                s.containers
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for container in containers {
+            let pods = pods.clone();
+            let pod_name = pod_name.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = stream_container_logs(pods, pod_name, container).await {
+                    warn!("log stream error: {e:?}");
+                }
+            });
         }
+
         Ok(())
     }
-    match inner(pods, pod_name.clone()).await {
+    match inner(pods, &pod).await {
         Ok(_) => {}
         Err(error) => {
-            println!("{pod_name}: error {error:?}");
+            println!("{}: error {error:?}", pod.name_any());
         }
-    }
+    };
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    let client = Client::try_default().await?;
-    let api = Api::<Pod>::default_namespaced(client);
-    let use_watchlist = std::env::var("WATCHLIST")
-        .map(|s| s == "1")
-        .unwrap_or(false);
-    let wc = if use_watchlist {
-        // requires WatchList feature gate on 1.27 or later
-        watcher::Config::default().streaming_lists()
-    } else {
-        watcher::Config::default()
-    };
 
-    watcher(api.clone(), wc)
+    let client = Client::try_default().await?;
+    let pods: Api<Pod> = Api::default_namespaced(client);
+
+    let seen = Arc::new(Mutex::new(HashSet::<String>::new()));
+
+    watcher(pods.clone(), watcher::Config::default())
         .applied_objects()
         .default_backoff()
-        .zip(stream::repeat(api.clone()))
-        .map(|(p, local_api)| p.and_then(|ok_p| std::result::Result::Ok((ok_p, local_api))))
-        .try_for_each(|(p, local_api)| async move {
-            let phase = p.status.as_ref().and_then(|s| s.phase.as_ref());
-            let pod_name = p.name_any();
-            info!("saw {} in {:?}", pod_name, phase);
-            if Some(&"Running".to_string()) == phase {
-                println!("Running!");
-                tokio::spawn(logger(local_api, pod_name));
+        .try_for_each(|pod| {
+            let pods = pods.clone();
+            let seen = seen.clone();
+
+            async move {
+                let pod_name = pod.name_any();
+                let uid = pod.uid().unwrap_or_default();
+                let phase = pod.status.as_ref().and_then(|s| s.phase.as_ref());
+
+                info!("pod {} phase {:?}", pod_name, phase);
+
+                if let Some(status) = &pod.status {
+                    if let Some(conditions) = &status.conditions {
+                        for c in conditions {
+                            info!("pod {} condition {} = {}", pod_name, c.type_, c.status);
+                        }
+                    }
+
+                    if let Some(cs) = &status.container_statuses {
+                        for c in cs {
+                            if c.restart_count > 0 {
+                                warn!(
+                                    "container {} in pod {} restarted {} times",
+                                    c.name, pod_name, c.restart_count
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if phase == Some(&"Running".to_string()) {
+                    let mut seen = seen.lock().await;
+                    if seen.insert(uid) {
+                        start_pod_logging(pods, pod).await;
+                    }
+                }
+
+                Ok(())
             }
-            Ok(())
         })
         .await?;
+
     Ok(())
 }
