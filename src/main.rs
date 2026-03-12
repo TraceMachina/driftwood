@@ -17,7 +17,7 @@ use kube::{
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// Namespace to read from (default: current)
@@ -30,17 +30,34 @@ struct Args {
 
     /// No tail lines
     #[arg(long, default_value_t = false, conflicts_with = "tail_lines")]
-    no_tail_lines: bool
+    no_tail_lines: bool,
+
+    // Dump config at the start of the log
+    #[arg(short, long, default_value_t = false)]
+    dump_config: bool
 }
 
 async fn stream_container_logs(
     pods: Api<Pod>,
     pod_name: String,
     container: String,
-    tail_lines: Option<i64>
+    args: Args,
 ) -> anyhow::Result<()> {
     let log_path = format!("logs/{pod_name}/{container}.log");
     let mut file = File::create(&log_path).with_context(|| format!("opening {log_path}"))?;
+    
+    if args.dump_config {
+        let mut pod = pods.get(&pod_name).await?;
+        pod.managed_fields_mut().clear(); // hide managed fields (as suggested by https://github.com/kube-rs/kube/blob/ab9040edbfeffb2584d77fa0edfd02eff8f60d2b/examples/kubectl.rs#L99)
+        writeln!(file, "{}", serde_norway::to_string(&pod)?)?;
+    }
+
+    let tail_lines = if args.no_tail_lines {
+        None 
+    } else {
+        Some(args.tail_lines)
+    };
+
 
     info!("starting logs for {pod_name}/{container}");
 
@@ -65,8 +82,8 @@ async fn stream_container_logs(
     Ok(())
 }
 
-async fn start_pod_logging(pods: Api<Pod>, pod: Pod, tail_lines: Option<i64>) {
-    async fn inner(pods: Api<Pod>, pod: &Pod, tail_lines: &Option<i64>) -> anyhow::Result<()> {
+async fn start_pod_logging(pods: Api<Pod>, pod: Pod, args: &Args) {
+    async fn inner(pods: Api<Pod>, pod: &Pod, args: &Args) -> anyhow::Result<()> {
         let pod_name = pod.name_any();
 
         let dir = format!("logs/{pod_name}");
@@ -86,10 +103,10 @@ async fn start_pod_logging(pods: Api<Pod>, pod: Pod, tail_lines: Option<i64>) {
         for container in containers {
             let pods = pods.clone();
             let pod_name: String = pod_name.clone();
-            let local_tail_lines = tail_lines.clone();
+            let local_args = args.to_owned();
 
             tokio::spawn(async move {
-                if let Err(e) = stream_container_logs(pods, pod_name, container, local_tail_lines).await {
+                if let Err(e) = stream_container_logs(pods, pod_name, container, local_args).await {
                     warn!("log stream error: {e:?}");
                 }
             });
@@ -97,7 +114,7 @@ async fn start_pod_logging(pods: Api<Pod>, pod: Pod, tail_lines: Option<i64>) {
 
         Ok(())
     }
-    match inner(pods, &pod, &tail_lines).await {
+    match inner(pods, &pod, args).await {
         Ok(_) => {}
         Err(error) => {
             println!("{}: error {error:?}", pod.name_any());
@@ -112,19 +129,13 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let client = Client::try_default().await?;
-    let ns = args.namespace.unwrap_or_else(|| client.default_namespace().to_string());
+    let ns = args.namespace.clone().unwrap_or_else(|| client.default_namespace().to_string());
 
     let namespaces: Api<Namespace> = Api::all(client.clone());
     let namespace = namespaces.get(&ns).await;
     if let Err(e) = namespace {
         return Err(e.into());
     }
-
-    let tail_lines = if args.no_tail_lines {
-        None 
-    } else {
-        Some(args.tail_lines)
-    };
 
     let pods: Api<Pod> = Api::namespaced(client, &ns);
 
@@ -136,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
         .try_for_each(|pod| {
             let pods = pods.clone();
             let seen = seen.clone();
+            let local_args = args.clone();
 
             async move {
                 let pod_name = pod.name_any();
@@ -166,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
                 if phase == Some(&"Running".to_string()) {
                     let mut seen = seen.lock().await;
                     if seen.insert(uid) {
-                        start_pod_logging(pods, pod, tail_lines).await;
+                        start_pod_logging(pods, pod, &local_args).await;
                     }
                 }
 
