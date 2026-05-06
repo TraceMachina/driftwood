@@ -18,7 +18,10 @@ use kube::{
     runtime::{WatchStreamExt, watcher},
 };
 use serde::Serialize;
-use tokio::sync::Mutex;
+use tokio::{
+    signal::unix::{SignalKind, signal},
+    sync::Mutex,
+};
 use tracing::{info, warn};
 
 #[derive(Parser, Debug, Clone)]
@@ -40,6 +43,14 @@ struct Args {
     #[arg(long)]
     kubeconfig: Option<PathBuf>,
 
+    /// Filter pods by label selector (e.g. "app=foo,role=worker")
+    #[arg(long)]
+    label_selector: Option<String>,
+
+    /// Filter pods by field selector
+    #[arg(long)]
+    field_selector: Option<String>,
+
     /// Name for this run; used as the log subdirectory (default: UTC timestamp)
     #[arg(long)]
     run_name: Option<String>,
@@ -56,6 +67,10 @@ struct Args {
     #[arg(long, default_value_t = false, conflicts_with = "tail_lines")]
     no_tail_lines: bool,
 
+    /// Include kube-side timestamps on every log line
+    #[arg(long, default_value_t = false)]
+    timestamps: bool,
+
     // Dump config at the start of the log
     #[arg(short, long, default_value_t = false)]
     dump_config: bool,
@@ -71,6 +86,8 @@ struct RunManifest {
     cluster_url: Option<String>,
     namespace: Option<String>,
     all_namespaces: bool,
+    label_selector: Option<String>,
+    field_selector: Option<String>,
     argv: Vec<String>,
     captured: Vec<CapturedPod>,
 }
@@ -81,6 +98,7 @@ struct CapturedPod {
     namespace: String,
     uid: String,
     started_at: String,
+    pod_yaml_path: Option<String>,
     containers: Vec<CapturedContainer>,
 }
 
@@ -88,6 +106,7 @@ struct CapturedPod {
 struct CapturedContainer {
     name: String,
     log_path: String,
+    previous_log_path: Option<String>,
 }
 
 struct RunState {
@@ -159,12 +178,6 @@ async fn stream_container_logs(
     let mut file =
         File::create(&log_path).with_context(|| format!("opening {}", log_path.display()))?;
 
-    if args.dump_config {
-        let mut pod = pods.get(&pod_name).await?;
-        pod.managed_fields_mut().clear(); // hide managed fields (as suggested by https://github.com/kube-rs/kube/blob/ab9040edbfeffb2584d77fa0edfd02eff8f60d2b/examples/kubectl.rs#L99)
-        writeln!(file, "{}", serde_norway::to_string(&pod)?)?;
-    }
-
     let tail_lines = if args.no_tail_lines {
         None
     } else {
@@ -180,6 +193,7 @@ async fn stream_container_logs(
                 container: Some(container.clone()),
                 follow: true,
                 tail_lines,
+                timestamps: args.timestamps,
                 ..LogParams::default()
             },
         )
@@ -194,10 +208,33 @@ async fn stream_container_logs(
     Ok(())
 }
 
+async fn fetch_previous_log(
+    pods: Api<Pod>,
+    pod_name: String,
+    container: String,
+    out_path: PathBuf,
+) {
+    let params = LogParams {
+        container: Some(container.clone()),
+        previous: true,
+        ..LogParams::default()
+    };
+    match pods.logs(&pod_name, &params).await {
+        Ok(content) => {
+            if let Err(e) = std::fs::write(&out_path, content) {
+                warn!("write previous log {}: {e:?}", out_path.display());
+            } else {
+                info!("captured previous log: {}", out_path.display());
+            }
+        }
+        Err(e) => warn!("fetch previous log for {pod_name}/{container}: {e:?}"),
+    }
+}
+
 async fn start_pod_logging(client: Client, pod: Pod, args: &Args, run: Arc<RunState>) {
     async fn inner(
         client: Client,
-        pod: &Pod,
+        pod: Pod,
         args: &Args,
         run: Arc<RunState>,
     ) -> anyhow::Result<()> {
@@ -210,6 +247,18 @@ async fn start_pod_logging(client: Client, pod: Pod, args: &Args, run: Arc<RunSt
 
         let pods: Api<Pod> = Api::namespaced(client, &namespace);
 
+        let pod_yaml_path = if args.dump_config {
+            let path = pod_dir.join("pod.yaml");
+            let mut sanitized = pod.clone();
+            sanitized.managed_fields_mut().clear(); // hide managed fields (https://github.com/kube-rs/kube/blob/ab9040edbfeffb2584d77fa0edfd02eff8f60d2b/examples/kubectl.rs#L99)
+            let yaml = serde_norway::to_string(&sanitized)?;
+            std::fs::write(&path, yaml)
+                .with_context(|| format!("writing {}", path.display()))?;
+            Some(path.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+
         let containers = pod
             .spec
             .as_ref()
@@ -221,11 +270,37 @@ async fn start_pod_logging(client: Client, pod: Pod, args: &Args, run: Arc<RunSt
             })
             .unwrap_or_default();
 
+        let restarted: HashSet<String> = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.container_statuses.as_ref())
+            .map(|cs| {
+                cs.iter()
+                    .filter(|c| c.restart_count > 0)
+                    .map(|c| c.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let captured_containers = containers
             .iter()
-            .map(|c| CapturedContainer {
-                name: c.clone(),
-                log_path: pod_dir.join(format!("{c}.log")).to_string_lossy().into_owned(),
+            .map(|c| {
+                let log_path = pod_dir.join(format!("{c}.log"));
+                let previous_log_path = if restarted.contains(c) {
+                    Some(
+                        pod_dir
+                            .join(format!("{c}.previous.log"))
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                } else {
+                    None
+                };
+                CapturedContainer {
+                    name: c.clone(),
+                    log_path: log_path.to_string_lossy().into_owned(),
+                    previous_log_path,
+                }
             })
             .collect();
 
@@ -234,9 +309,20 @@ async fn start_pod_logging(client: Client, pod: Pod, args: &Args, run: Arc<RunSt
             namespace: namespace.clone(),
             uid,
             started_at: Utc::now().to_rfc3339(),
+            pod_yaml_path,
             containers: captured_containers,
         })
         .await?;
+
+        for container in &containers {
+            if restarted.contains(container) {
+                let pods = pods.clone();
+                let pod_name = pod_name.clone();
+                let container = container.clone();
+                let prev_path = pod_dir.join(format!("{container}.previous.log"));
+                tokio::spawn(fetch_previous_log(pods, pod_name, container, prev_path));
+            }
+        }
 
         for container in containers {
             let pods = pods.clone();
@@ -259,8 +345,9 @@ async fn start_pod_logging(client: Client, pod: Pod, args: &Args, run: Arc<RunSt
         Ok(())
     }
 
-    if let Err(e) = inner(client, &pod, args, run).await {
-        warn!("{}: error {e:?}", pod.name_any());
+    let pod_name = pod.name_any();
+    if let Err(e) = inner(client, pod, args, run).await {
+        warn!("{pod_name}: error {e:?}");
     }
 }
 
@@ -312,6 +399,8 @@ async fn main() -> anyhow::Result<()> {
         cluster_url: Some(cluster_url),
         namespace: namespace.clone(),
         all_namespaces: args.all_namespaces,
+        label_selector: args.label_selector.clone(),
+        field_selector: args.field_selector.clone(),
         argv: std::env::args().collect(),
         captured: Vec::new(),
     };
@@ -334,9 +423,17 @@ async fn main() -> anyhow::Result<()> {
         Api::all(client.clone())
     };
 
+    let mut watcher_config = watcher::Config::default();
+    if let Some(s) = &args.label_selector {
+        watcher_config = watcher_config.labels(s);
+    }
+    if let Some(s) = &args.field_selector {
+        watcher_config = watcher_config.fields(s);
+    }
+
     let seen = Arc::new(Mutex::new(HashSet::<String>::new()));
 
-    let watch = watcher(pods.clone(), watcher::Config::default())
+    let watch = watcher(pods.clone(), watcher_config)
         .applied_objects()
         .default_backoff()
         .try_for_each(|pod| {
@@ -382,10 +479,17 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
+    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+
     let result = tokio::select! {
         r = watch => r.map_err(anyhow::Error::from),
-        _ = tokio::signal::ctrl_c() => {
-            info!("received ctrl-c, finalizing run manifest");
+        _ = sigint.recv() => {
+            info!("received SIGINT, finalizing run manifest");
+            Ok(())
+        }
+        _ = sigterm.recv() => {
+            info!("received SIGTERM, finalizing run manifest");
             Ok(())
         }
     };
